@@ -35,8 +35,14 @@
   .stat .value.in  { color: #4ade80; }
   .stat .value.out { color: #38bdf8; }
 
-  #legend { left: 14px; top: 86px; padding: 12px 14px; width: 218px; }
-  #legend h2 { font-size: 10px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 9px; }
+  #leftcol { left: 14px; top: 86px; display: flex; flex-direction: column; gap: 10px; }
+  #legend, #talkers { padding: 12px 14px; width: 218px; }
+  #legend h2, #talkers h2 { font-size: 10px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 9px; }
+  .tk-row { display: flex; gap: 7px; font-size: 10.5px; margin: 5px 0; align-items: baseline; }
+  .tk-rank { color: var(--dim); width: 15px; flex: none; text-align: right; }
+  .tk-host { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .tk-val { color: var(--dim); flex: none; font-variant-numeric: tabular-nums; }
+  .tk-empty { color: var(--dim); font-size: 10.5px; }
   .cat-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 11px; }
   .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
   .cat-name { width: 72px; }
@@ -71,9 +77,15 @@
   <div class="stat panel"><div class="label">Total packets</div><div class="value" id="s-total">0</div></div>
 </div>
 
-<div id="legend" class="hud panel">
-  <h2>TRAFFIC TYPE</h2>
-  <!-- rows injected -->
+<div id="leftcol" class="hud">
+  <div id="legend" class="panel">
+    <h2>TRAFFIC TYPE</h2>
+    <!-- rows injected -->
+  </div>
+  <div id="talkers" class="panel">
+    <h2>TOP TALKERS · BYTES</h2>
+    <div id="talkers-rows"><div class="tk-empty">waiting for traffic…</div></div>
+  </div>
 </div>
 
 <div id="banner" class="hud panel hidden">
@@ -420,11 +432,25 @@ let live = false, everConnected = false;
 let simTimer = null;
 const localWindow = [];   // [t, bytes, dir] for sim-mode rates
 
+const localTalkers = new Map();   // sim mode: remote ip -> {pkts, bytes}
 function onPacket(p) {
   totalPkts++;
   counts[p.cat] = (counts[p.cat] || 0) + 1;
   if (queue.length < MAX_QUEUE) queue.push(p);
-  if (!live) localWindow.push([performance.now(), p.len, p.dir]);
+  if (!live) {
+    localWindow.push([performance.now(), p.len, p.dir]);
+    const remote = p.dir === "in" ? p.src : p.dst;
+    if (remote) {
+      const t = localTalkers.get(remote) || { pkts: 0, bytes: 0 };
+      t.pkts++; t.bytes += p.len;
+      localTalkers.set(remote, t);
+      if (localTalkers.size > 4000) {  // bound memory like the server does
+        const keep = [...localTalkers.entries()].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 1000);
+        localTalkers.clear();
+        for (const [ip, v] of keep) localTalkers.set(ip, v);
+      }
+    }
+  }
 }
 
 function setStatus(mode) {
@@ -477,6 +503,7 @@ es.onmessage = (e) => {
       for (const c of CATS) {
         if (msg.cats[c.name]) counts[c.name] = msg.cats[c.name].in + msg.cats[c.name].out;
       }
+      if (msg.top) { topList = msg.top; renderTalkers(); }
     }
   } catch (_) {}
 };
@@ -531,7 +558,36 @@ setInterval(() => {
   document.getElementById("s-out").textContent = fmtBps(outB);
   document.getElementById("s-total").textContent = fmtNum(totalPkts);
   lastStats.pps = (localWindow.length / 5).toFixed(1); lastStats.inBps = inB; lastStats.outBps = outB;
+  topList = [...localTalkers.entries()]
+    .map(([ip, t]) => ({ ip, pkts: t.pkts, bytes: t.bytes }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 10);
+  renderTalkers();
 }, 1000);
+
+/* ========================== top talkers ============================= */
+
+let topList = [];
+const talkersRows = document.getElementById("talkers-rows");
+function renderTalkers() {
+  if (!topList.length) return;
+  talkersRows.innerHTML = topList.map((t, i) => {
+    const name = dnsCache.get(t.ip);
+    return `<div class="tk-row"><span class="tk-rank">${i + 1}</span>` +
+      `<span class="tk-host" title="${t.ip} · ${fmtNum(t.pkts)} pkts">${name || t.ip}</span>` +
+      `<span class="tk-val">${fmtBytes(t.bytes)}</span></div>`;
+  }).join("");
+  // resolve unseen IPs in the background; re-render when names land
+  for (const t of topList) {
+    if (!dnsCache.has(t.ip)) resolveIp(t.ip).then(n => { if (n) renderTalkers(); });
+  }
+}
+function fmtBytes(b) {
+  if (b >= 1e9) return (b / 1e9).toFixed(1) + " GB";
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+  if (b >= 1e3) return (b / 1e3).toFixed(1) + " kB";
+  return (b | 0) + " B";
+}
 
 /* ============================== legend ============================== */
 

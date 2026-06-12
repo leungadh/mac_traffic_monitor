@@ -61,6 +61,8 @@ Each roadway has 8 lanes, one per category, with a color-coded edge strip and fl
 
 ## Controls
 
+A **Top Talkers** panel below the legend ranks the 10 remote hosts by bytes transferred, showing domain names where reverse DNS resolves them (hover a row for the raw IP and packet count). Counts are exact, aggregated server-side.
+
 Drag to orbit, scroll to zoom, **click any vehicle** to inspect the packet it represents (type, direction, src → dst, ports, bytes). When an IP has a reverse-DNS record, the inspector swaps the address for its domain name (with the IP in parentheses) — lookups are served by `capture.py` at `/resolve?ip=` and cached, so it stays fast. Some IPs (notably CDNs) have no PTR record and keep showing the bare address. An overhead gantry billboard shows the live traffic report. Status dot: green = live capture, amber = simulation.
 
 ## Troubleshooting

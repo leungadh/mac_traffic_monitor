@@ -118,6 +118,7 @@ class Hub:
         self.clients = set()
         self.lock = threading.Lock()
         self.counts = {c: {"in": 0, "out": 0, "bytes": 0} for c in CATEGORIES}
+        self.talkers = {}  # remote ip -> [pkts, bytes]
         self.total_pkts = 0
         self.total_bytes = 0
         self.window = []  # (ts, bytes, dir) for rate calc
@@ -156,6 +157,16 @@ class Hub:
             self.total_pkts += 1
             self.total_bytes += ln
             self.window.append((now, ln, d))
+            remote = evt["src"] if d == "in" else evt["dst"]
+            t = self.talkers.get(remote)
+            if t:
+                t[0] += 1
+                t[1] += ln
+            else:
+                if len(self.talkers) > 4000:  # bound memory: keep heaviest 1000
+                    keep = sorted(self.talkers.items(), key=lambda kv: kv[1][1], reverse=True)[:1000]
+                    self.talkers = dict(keep)
+                self.talkers[remote] = [1, ln]
 
         if self.log_file:
             try:
@@ -192,6 +203,10 @@ class Hub:
                     "inBps": round(sum(w[1] for w in win if w[2] == "in") / 5.0),
                     "outBps": round(sum(w[1] for w in win if w[2] == "out") / 5.0),
                     "cats": self.counts,
+                    "top": [
+                        {"ip": ip, "pkts": v[0], "bytes": v[1]}
+                        for ip, v in sorted(self.talkers.items(), key=lambda kv: kv[1][1], reverse=True)[:10]
+                    ],
                 }
             self._push(json.dumps(snapshot, separators=(",", ":")))
 
