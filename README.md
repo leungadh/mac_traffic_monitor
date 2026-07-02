@@ -7,7 +7,7 @@ A two-way 3D highway visualizing your machine's live network traffic. Each packe
 ## Quick start
 
 ```bash
-cd "~/Claude/Projects/Traffic monitor"
+cd ~/Projects/Claude/mac_traffic_monitor
 sudo python3 capture.py          # real capture (sudo needed for packet sniffing)
 # then open http://localhost:8765/ in your browser
 # stop with Ctrl-C
@@ -18,9 +18,11 @@ No installs needed — the capture script is pure Python stdlib and uses macOS's
 Other modes:
 
 ```bash
-python3 capture.py --simulate    # demo traffic, no sudo
-sudo python3 capture.py -i en0   # pick an interface
-python3 capture.py --no-log      # skip JSONL logging
+python3 capture.py --simulate                    # demo traffic, no sudo
+sudo python3 capture.py -i en0                   # pick an interface
+python3 capture.py --no-log                      # skip JSONL logging
+python3 capture.py --replay traffic_log.jsonl    # replay a recorded log, no sudo
+python3 capture.py --replay traffic_log.jsonl --speed 10   # …at 10× speed
 ```
 
 You can also open `dashboard.html` directly as a file — it connects to `localhost:8765` if the feed is running, otherwise it switches itself to simulation mode so you always see something.
@@ -29,7 +31,7 @@ You can also open `dashboard.html` directly as a file — it connects to `localh
 
 ```
 tcpdump (sudo) ──► capture.py ──► traffic_log.jsonl        (observe + log)
-                       │
+lsof (app names) ──────┤
                        ├──► SSE stream  /events             (live feed, ≤120 evt/s sampled
                        │                                     + exact 1-second stats)
                        ├──► reverse DNS  /resolve?ip=       (cached PTR lookups for the
@@ -41,6 +43,8 @@ tcpdump (sudo) ──► capture.py ──► traffic_log.jsonl        (observe 
 ```
 
 `capture.py` parses tcpdump output, classifies each packet by service, determines direction by comparing against the machine's local IP, appends every packet to `traffic_log.jsonl` (rotated at 50 MB), and broadcasts over Server-Sent Events. Per-packet events are sampled to at most 120/s so the browser never drowns, while a once-per-second `stats` event carries exact totals, packets/sec, and in/out throughput.
+
+During real capture it also polls `lsof` every few seconds to attribute each packet to the app that owns the connection (Chrome, Spotify, …) — shown in the packet inspector. `--replay` re-feeds a recorded `traffic_log.jsonl` through the same pipeline, paced by the log's own timestamps (scaled by `--speed`), with logging disabled so the log isn't appended to itself.
 
 The dashboard spawns a vehicle per packet event — vehicle length scales with packet size — and reads the HUD numbers from the exact stats events, so the visualization is illustrative but the numbers are true.
 
@@ -61,9 +65,11 @@ Each roadway has 8 lanes, one per category, with a color-coded edge strip and fl
 
 ## Controls
 
-A **Top Talkers** panel below the legend ranks the 10 remote hosts by bytes transferred, showing domain names where reverse DNS resolves them (hover a row for the raw IP and packet count). Counts are exact, aggregated server-side.
+A **Top Talkers** panel below the legend ranks the 10 remote hosts by bytes transferred, showing domain names where reverse DNS resolves them (hover a row for the raw IP and packet count). Counts are exact, aggregated server-side. Below it, a **throughput sparkline** charts inbound/outbound B/s over the last 3 minutes — hover it to read values at any point.
 
-Drag to orbit, scroll to zoom, **click any vehicle** to inspect the packet it represents (type, direction, src → dst, ports, bytes). When an IP has a reverse-DNS record, the inspector swaps the address for its domain name (with the IP in parentheses) — lookups are served by `capture.py` at `/resolve?ip=` and cached, so it stays fast. Some IPs (notably CDNs) have no PTR record and keep showing the bare address. An overhead gantry billboard shows the live traffic report. Status dot: green = live capture, amber = simulation.
+**Click a legend row** to hide/show that traffic category's lane (stats keep counting; it's a visual filter). **Zoom in** and each vehicle grows a floating label naming the remote host it's talking to — IP first, swapping to the domain name when reverse DNS resolves.
+
+Drag to orbit, scroll to zoom, **click any vehicle** to inspect the packet it represents (type, direction, src → dst, ports, bytes, and — during real capture — the app that owns the connection). When an IP has a reverse-DNS record, the inspector swaps the address for its domain name (with the IP in parentheses) — lookups are served by `capture.py` at `/resolve?ip=` and cached, so it stays fast. Some IPs (notably CDNs) have no PTR record and keep showing the bare address. An overhead gantry billboard shows the live traffic report. Status dot: green = live capture, amber = simulation.
 
 ## Troubleshooting
 
@@ -74,8 +80,10 @@ Drag to orbit, scroll to zoom, **click any vehicle** to inspect the packet it re
 One JSON object per packet in `traffic_log.jsonl`:
 
 ```json
-{"ts":1781225781.0,"dir":"in","cat":"HTTPS","proto":"tcp","len":1495,"src":"64.203.132.231","dst":"192.168.1.10","sport":443,"dport":53060}
+{"ts":1781225781.0,"dir":"in","cat":"HTTPS","proto":"tcp","len":1495,"src":"64.203.132.231","dst":"192.168.1.10","sport":443,"dport":53060,"app":"Google Chrome"}
 ```
+
+`app` is the process owning the connection (from `lsof`), empty when unknown.
 
 ## Files
 

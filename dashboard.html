@@ -36,14 +36,24 @@
   .stat .value.out { color: #38bdf8; }
 
   #leftcol { left: 14px; top: 86px; display: flex; flex-direction: column; gap: 10px; }
-  #legend, #talkers { padding: 12px 14px; width: 218px; }
-  #legend h2, #talkers h2 { font-size: 10px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 9px; }
+  #legend, #talkers, #spark { padding: 12px 14px; width: 218px; }
+  #legend h2, #talkers h2, #spark h2 { font-size: 10px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 9px; }
+  #spark h2 { display: flex; justify-content: space-between; }
+  #spark-max { letter-spacing: 0; }
+  #spark-canvas { width: 190px; height: 46px; display: block; }
+  #spark-legend { display: flex; gap: 10px; font-size: 9.5px; color: var(--dim); margin-top: 6px; }
+  #spark-legend b { font-style: normal; }
+  #spark-readout { margin-left: auto; font-variant-numeric: tabular-nums; }
   .tk-row { display: flex; gap: 7px; font-size: 10.5px; margin: 5px 0; align-items: baseline; }
   .tk-rank { color: var(--dim); width: 15px; flex: none; text-align: right; }
   .tk-host { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
   .tk-val { color: var(--dim); flex: none; font-variant-numeric: tabular-nums; }
   .tk-empty { color: var(--dim); font-size: 10.5px; }
-  .cat-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 11px; }
+  .cat-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 11px;
+    cursor: pointer; user-select: none; }
+  .cat-row:hover { filter: brightness(1.25); }
+  .cat-row.off { opacity: .35; }
+  .cat-row.off .cat-name { text-decoration: line-through; }
   .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
   .cat-name { width: 72px; }
   .cat-count { color: var(--dim); margin-left: auto; font-variant-numeric: tabular-nums; }
@@ -86,6 +96,15 @@
     <h2>TOP TALKERS · BYTES</h2>
     <div id="talkers-rows"><div class="tk-empty">waiting for traffic…</div></div>
   </div>
+  <div id="spark" class="panel">
+    <h2>THROUGHPUT · 3 MIN <span id="spark-max"></span></h2>
+    <canvas id="spark-canvas"></canvas>
+    <div id="spark-legend">
+      <span><b style="color:#4ade80">▂</b> in</span>
+      <span><b style="color:#38bdf8">▂</b> out</span>
+      <span id="spark-readout"></span>
+    </div>
+  </div>
 </div>
 
 <div id="banner" class="hud panel hidden">
@@ -95,7 +114,7 @@
   then reload, or keep watching the demo.
 </div>
 
-<div id="hint" class="hud panel">drag&nbsp;·&nbsp;orbit&nbsp;&nbsp;|&nbsp;&nbsp;scroll&nbsp;·&nbsp;zoom&nbsp;&nbsp;|&nbsp;&nbsp;click&nbsp;a&nbsp;vehicle&nbsp;·&nbsp;inspect&nbsp;packet&nbsp;&nbsp;|&nbsp;&nbsp;left&nbsp;⬇&nbsp;in&nbsp;·&nbsp;right&nbsp;⬆&nbsp;out</div>
+<div id="hint" class="hud panel">drag&nbsp;·&nbsp;orbit&nbsp;&nbsp;|&nbsp;&nbsp;scroll&nbsp;·&nbsp;zoom&nbsp;(zoom&nbsp;in&nbsp;for&nbsp;host&nbsp;labels)&nbsp;&nbsp;|&nbsp;&nbsp;click&nbsp;a&nbsp;vehicle&nbsp;·&nbsp;inspect&nbsp;packet&nbsp;&nbsp;|&nbsp;&nbsp;click&nbsp;legend&nbsp;·&nbsp;filter&nbsp;&nbsp;|&nbsp;&nbsp;left&nbsp;⬇&nbsp;in&nbsp;·&nbsp;right&nbsp;⬆&nbsp;out</div>
 <div id="tooltip" class="panel"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -319,6 +338,51 @@ function part(mat, w, h, l, x, y, z) {
   return m;
 }
 
+/* origin labels — LRU-cached canvas textures keyed by label text
+   (remote IPs repeat heavily, so most spawns are cache hits) */
+const LABEL_DIST = 95;      // labels visible when camera is closer than this
+const LABEL_FADE = 25;      // fade-in band just inside LABEL_DIST
+const LABEL_H = 1.9;        // world-units height of the label quad
+const LABEL_CACHE_MAX = 300;
+const labelCache = new Map();  // text -> { tex, aspect }
+function labelAsset(text) {
+  let a = labelCache.get(text);
+  if (a) {                       // refresh LRU position
+    labelCache.delete(text);
+    labelCache.set(text, a);
+    return a;
+  }
+  const c = document.createElement("canvas");
+  let ctx = c.getContext("2d");
+  ctx.font = "bold 34px Menlo, monospace";
+  c.width = Math.ceil(ctx.measureText(text).width) + 16;
+  c.height = 44;
+  ctx = c.getContext("2d");      // resize resets state
+  ctx.font = "bold 34px Menlo, monospace";
+  ctx.fillStyle = "rgba(10,12,16,0.72)";
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = "#dbe4ee";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 8, 24);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  a = { tex, aspect: c.width / c.height };
+  if (labelCache.size >= LABEL_CACHE_MAX) {   // evict oldest
+    const [k, old] = labelCache.entries().next().value;
+    labelCache.delete(k);
+    old.tex.dispose();
+  }
+  labelCache.set(text, a);
+  return a;
+}
+function setLabel(v, text) {
+  if (text.length > 30) text = "…" + text.slice(-29);
+  const a = labelAsset(text);
+  v.label.material.map = a.tex;
+  v.label.material.needsUpdate = true;
+  v.label.scale.set(a.aspect * LABEL_H, LABEL_H, 1);
+}
+
 function buildVehicle(ci) {
   const g = new THREE.Group();           // built facing +z
   const body = catMats[ci], dim = catDimMats[ci];
@@ -380,9 +444,14 @@ function buildVehicle(ci) {
   glow.position.set(0, 0.05, -totLen * 0.7);
   g.add(glow);
 
+  const label = new THREE.Sprite(new THREE.SpriteMaterial({ transparent: true, depthWrite: false }));
+  label.position.set(0, 3.4, 0);
+  label.visible = false;
+  g.add(label);
+
   g.visible = false;
   scene.add(g);
-  const v = { grp: g, ci, glow, beaconA, beaconB, trailer, totLen, speed: 0, dirSign: 1, meta: null };
+  const v = { grp: g, ci, glow, beaconA, beaconB, trailer, totLen, speed: 0, dirSign: 1, meta: null, label, labelOn: false };
   g.traverse(o => { o.userData.v = v; });
   return v;
 }
@@ -391,8 +460,11 @@ const pools = CATS.map(() => []);
 const active = [];
 let createdCount = 0;
 
+const hiddenCats = new Set();   // legend-filtered categories (visual only; stats stay exact)
+
 function spawnVehicle(p) {
   const ci = CAT_INDEX[p.cat] ?? CAT_INDEX.Other;
+  if (hiddenCats.has(CATS[ci].name)) return;
   let v = pools[ci].pop();
   if (!v) {
     if (createdCount >= POOL_SIZE) return;
@@ -406,6 +478,15 @@ function spawnVehicle(p) {
   v.dirSign = dirSign;
   v.meta = p;
   v.speed = lo + Math.random() * (hi - lo);
+  const remote = p.dir === "in" ? p.src : p.dst;
+  v.labelOn = !!remote;
+  v.label.visible = false;                       // distance gate decides per frame
+  if (remote) {
+    setLabel(v, dnsCache.get(remote) || remote); // IP now, domain when rDNS lands
+    if (!dnsCache.has(remote)) {
+      resolveIp(remote).then(name => { if (name && v.meta === p) setLabel(v, name); });
+    }
+  }
   v.grp.rotation.y = dirSign === 1 ? 0 : Math.PI; // face direction of travel
   if (v.trailer) {                                 // semi: bigger packet = longer trailer
     const L = 3 + f * 4.5;
@@ -499,6 +580,7 @@ es.onmessage = (e) => {
       document.getElementById("s-out").textContent = fmtBps(msg.outBps);
       document.getElementById("s-total").textContent = fmtNum(msg.totalPkts);
       lastStats.pps = msg.pps; lastStats.inBps = msg.inBps; lastStats.outBps = msg.outBps;
+      pushSpark(msg.inBps, msg.outBps);
       totalPkts = msg.totalPkts;
       for (const c of CATS) {
         if (msg.cats[c.name]) counts[c.name] = msg.cats[c.name].in + msg.cats[c.name].out;
@@ -558,6 +640,7 @@ setInterval(() => {
   document.getElementById("s-out").textContent = fmtBps(outB);
   document.getElementById("s-total").textContent = fmtNum(totalPkts);
   lastStats.pps = (localWindow.length / 5).toFixed(1); lastStats.inBps = inB; lastStats.outBps = outB;
+  pushSpark(inB, outB);
   topList = [...localTalkers.entries()]
     .map(([ip, t]) => ({ ip, pkts: t.pkts, bytes: t.bytes }))
     .sort((a, b) => b.bytes - a.bytes)
@@ -589,6 +672,78 @@ function fmtBytes(b) {
   return (b | 0) + " B";
 }
 
+/* ======================= throughput sparkline ======================= */
+
+const SPARK_LEN = 180;                    // 3 min of 1 s samples
+const SPARK_W = 190, SPARK_H = 46;
+const sparkHist = [];                     // { i, o } B/s
+const sparkCanvas = document.getElementById("spark-canvas");
+const sparkMaxEl = document.getElementById("spark-max");
+const sparkReadout = document.getElementById("spark-readout");
+{
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  sparkCanvas.width = SPARK_W * dpr;
+  sparkCanvas.height = SPARK_H * dpr;
+  sparkCanvas.getContext("2d").scale(dpr, dpr);
+}
+function pushSpark(inBps, outBps) {
+  sparkHist.push({ i: inBps, o: outBps });
+  if (sparkHist.length > SPARK_LEN) sparkHist.shift();
+  drawSpark();
+}
+function drawSpark(hoverIdx = -1) {
+  const ctx = sparkCanvas.getContext("2d");
+  ctx.clearRect(0, 0, SPARK_W, SPARK_H);
+  const n = sparkHist.length;
+  if (!n) return;
+  const max = Math.max(1, ...sparkHist.map(s => Math.max(s.i, s.o)));
+  const step = SPARK_W / (SPARK_LEN - 1);
+  const x = k => SPARK_W - (n - 1 - k) * step;          // newest sample at the right edge
+  const y = v => SPARK_H - 1 - (v / max) * (SPARK_H - 4);
+
+  ctx.strokeStyle = "rgba(255,255,255,0.10)";           // recessive baseline
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, SPARK_H - 0.5); ctx.lineTo(SPARK_W, SPARK_H - 0.5); ctx.stroke();
+
+  for (const [key, color] of [["i", "#4ade80"], ["o", "#38bdf8"]]) {
+    ctx.beginPath();
+    for (let k = 0; k < n; k++) ctx[k ? "lineTo" : "moveTo"](x(k), y(sparkHist[k][key]));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+    ctx.lineTo(x(n - 1), SPARK_H);                      // close down to baseline
+    ctx.lineTo(x(0), SPARK_H);
+    ctx.globalAlpha = 0.13;
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  if (hoverIdx >= 0 && hoverIdx < n) {
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x(hoverIdx) + 0.5, 0); ctx.lineTo(x(hoverIdx) + 0.5, SPARK_H); ctx.stroke();
+    for (const [key, color] of [["i", "#4ade80"], ["o", "#38bdf8"]]) {
+      ctx.beginPath();
+      ctx.arc(x(hoverIdx), y(sparkHist[hoverIdx][key]), 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+  }
+  sparkMaxEl.textContent = "max " + fmtBps(max);
+}
+sparkCanvas.addEventListener("pointermove", e => {
+  const n = sparkHist.length;
+  if (!n) return;
+  const px = e.clientX - sparkCanvas.getBoundingClientRect().left;
+  const k = Math.round(n - 1 - (SPARK_W - px) / (SPARK_W / (SPARK_LEN - 1)));
+  if (k < 0 || k >= n) { drawSpark(); sparkReadout.textContent = ""; return; }
+  drawSpark(k);
+  sparkReadout.textContent = `⬇ ${fmtBps(sparkHist[k].i)} ⬆ ${fmtBps(sparkHist[k].o)}`;
+});
+sparkCanvas.addEventListener("pointerleave", () => { drawSpark(); sparkReadout.textContent = ""; });
+
 /* ============================== legend ============================== */
 
 const legend = document.getElementById("legend");
@@ -600,6 +755,25 @@ const legendEls = CATS.map(c => {
     <div class="cat-wrap"><span class="cat-name">${c.name}</span>
     <span class="cat-count">0</span>
     <div class="cat-bar" style="background:${hex}"></div></div>`;
+  row.title = "click to hide/show this traffic type";
+  row.addEventListener("click", () => {
+    const ci = CAT_INDEX[c.name];
+    if (hiddenCats.has(c.name)) {
+      hiddenCats.delete(c.name);
+      row.classList.remove("off");
+    } else {
+      hiddenCats.add(c.name);
+      row.classList.add("off");
+      for (let i = active.length - 1; i >= 0; i--) {  // clear the lane immediately
+        const v = active[i];
+        if (v.ci === ci) {
+          v.grp.visible = false;
+          active.splice(i, 1);
+          pools[ci].push(v);
+        }
+      }
+    }
+  });
   legend.appendChild(row);
   return { count: row.querySelector(".cat-count"), bar: row.querySelector(".cat-bar") };
 });
@@ -678,7 +852,8 @@ function pickVehicle(e) {
   tooltip.innerHTML =
     `<span class="tt-cat" style="color:${hex}">${m.cat}</span>` +
     ` <span class="tt-dim">· ${(m.proto || "?").toUpperCase()} · ${m.dir === "in" ? "⬇ inbound" : "⬆ outbound"}</span><br>` +
-    `${flow}<br><span class="tt-dim">${m.len} bytes</span>`;
+    `${flow}<br><span class="tt-dim">${m.len} bytes</span>` +
+    (m.app ? `<span class="tt-dim"> · via </span>${m.app}` : "");
   tooltip.style.display = "block";
 
   // upgrade IPs to domain names as reverse-DNS results arrive
@@ -722,6 +897,11 @@ function animate() {
     const v = active[i];
     v.grp.position.z += v.dirSign * v.speed * dt;
     if (v.beaconA) { v.beaconA.visible = blink === 0; v.beaconB.visible = blink === 1; }
+    if (v.labelOn) {
+      const dist = camera.position.distanceTo(v.grp.position);
+      v.label.visible = dist < LABEL_DIST;
+      if (v.label.visible) v.label.material.opacity = Math.min(1, (LABEL_DIST - dist) / LABEL_FADE);
+    }
     if (Math.abs(v.grp.position.z) > ROAD_LEN / 2 + 10) {
       v.grp.visible = false;
       active.splice(i, 1);

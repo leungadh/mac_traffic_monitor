@@ -109,6 +109,55 @@ def is_private(ip):
     )
 
 
+# ---------------------------------------------------------- process attribution
+
+_PORT_APPS = {}  # (proto, local_port) -> app name, refreshed by lsof_loop
+_PORT_APPS_LOCK = threading.Lock()
+
+
+def port_app(proto, port):
+    if not port:
+        return ""
+    with _PORT_APPS_LOCK:
+        return _PORT_APPS.get((proto, port), "")
+
+
+def lsof_loop(interval=3.0):
+    """Poll lsof to map local ports -> owning process name (macOS).
+
+    Field output (-F cnP): c=command, P=protocol, n=name like
+    '192.168.1.10:53060->1.2.3.4:443' or '*:5353'. Local side is before '->'.
+    """
+    while True:
+        try:
+            out = subprocess.run(
+                ["lsof", "-nP", "-i", "-F", "cnP"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except FileNotFoundError:
+            print("[lsof] not found — process attribution disabled")
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            time.sleep(interval)
+            continue
+        table = {}
+        cmd = proto = ""
+        for line in out.splitlines():
+            tag, val = line[:1], line[1:]
+            if tag == "c":
+                cmd = val
+            elif tag == "P":
+                proto = val.lower()
+            elif tag == "n":
+                lport = val.split("->")[0].rsplit(":", 1)[-1]
+                if lport.isdigit() and cmd:
+                    table[(proto, int(lport))] = cmd
+        with _PORT_APPS_LOCK:
+            _PORT_APPS.clear()
+            _PORT_APPS.update(table)
+        time.sleep(interval)
+
+
 # ---------------------------------------------------------------- hub / state
 
 class Hub:
@@ -280,6 +329,7 @@ def run_tcpdump(hub, iface):
                 "dst": dst,
                 "sport": sport,
                 "dport": dport,
+                "app": port_app(proto, sport if d == "out" else dport),
             }
         )
 
@@ -290,15 +340,15 @@ def run_tcpdump(hub, iface):
 # ---------------------------------------------------------------- simulator
 
 SIM_PROFILES = [
-    # (cat, proto, dport, weight, len_range)
-    ("HTTPS", "tcp", 443, 45, (60, 1500)),
-    ("Streaming", "udp", 443, 20, (400, 1500)),
-    ("DNS", "udp", 53, 12, (60, 300)),
-    ("HTTP", "tcp", 80, 6, (60, 1500)),
-    ("SSH", "tcp", 22, 5, (60, 500)),
-    ("Email", "tcp", 993, 4, (80, 1200)),
-    ("ICMP", "icmp", 0, 3, (64, 120)),
-    ("Other", "tcp", 8443, 5, (60, 1500)),
+    # (cat, proto, dport, weight, len_range, app)
+    ("HTTPS", "tcp", 443, 45, (60, 1500), "Safari"),
+    ("Streaming", "udp", 443, 20, (400, 1500), "Spotify"),
+    ("DNS", "udp", 53, 12, (60, 300), "mDNSResponder"),
+    ("HTTP", "tcp", 80, 6, (60, 1500), "Safari"),
+    ("SSH", "tcp", 22, 5, (60, 500), "ssh"),
+    ("Email", "tcp", 993, 4, (80, 1200), "Mail"),
+    ("ICMP", "icmp", 0, 3, (64, 120), "ping"),
+    ("Other", "tcp", 8443, 5, (60, 1500), "node"),
 ]
 
 
@@ -307,7 +357,7 @@ def run_simulator(hub):
     me = "192.168.1.10"
     weights = [p[3] for p in SIM_PROFILES]
     while True:
-        cat, proto, dport, _, lr = random.choices(SIM_PROFILES, weights=weights)[0]
+        cat, proto, dport, _, lr, app = random.choices(SIM_PROFILES, weights=weights)[0]
         d = random.choices(["in", "out"], weights=[60, 40])[0]
         remote = f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
         sport = random.randint(49152, 65535)
@@ -321,10 +371,38 @@ def run_simulator(hub):
             "dst": me if d == "in" else remote,
             "sport": dport if d == "in" else sport,
             "dport": sport if d == "in" else dport,
+            "app": app,
         }
         hub.packet(evt)
         # bursty: occasional rapid-fire
         time.sleep(random.choice([0.002] * 2 + [0.02] * 5 + [0.15]))
+
+
+# ---------------------------------------------------------------- replay
+
+def run_replay(hub, path, speed):
+    """Re-feed a recorded traffic_log.jsonl, paced by its timestamps."""
+    print(f"[replay] {path} at {speed}x")
+    n = 0
+    prev_ts = None
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    evt = json.loads(line)
+                except ValueError:
+                    continue
+                ts = evt.get("ts")
+                if prev_ts is not None and isinstance(ts, (int, float)):
+                    time.sleep(min(max(ts - prev_ts, 0), 5.0) / speed)
+                if isinstance(ts, (int, float)):
+                    prev_ts = ts
+                evt["ts"] = round(time.time(), 3)  # rolling stats need current time
+                hub.packet(evt)
+                n += 1
+    except OSError as e:
+        sys.exit(f"[replay] cannot read {path}: {e}")
+    print(f"[replay] finished — {n} packets replayed (server still running)")
 
 
 # ---------------------------------------------------------------- HTTP / SSE
@@ -386,16 +464,28 @@ def main():
     ap = argparse.ArgumentParser(description="Traffic capture + live feed")
     ap.add_argument("-i", "--iface", help="interface to sniff (default: tcpdump default)")
     ap.add_argument("--simulate", action="store_true", help="generate fake traffic (no sudo)")
+    ap.add_argument("--replay", metavar="PATH", help="replay a traffic_log.jsonl (no sudo)")
+    ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier (default 1)")
     ap.add_argument("--no-log", action="store_true", help="disable JSONL logging")
     ap.add_argument("-p", "--port", type=int, default=PORT)
     args = ap.parse_args()
 
-    hub = Hub(log_enabled=not args.no_log)
+    if args.simulate and args.replay:
+        ap.error("--simulate and --replay are mutually exclusive")
+    if args.speed <= 0:
+        ap.error("--speed must be > 0")
+
+    # replaying the log back into itself would double it — logging off in replay mode
+    log_enabled = not args.no_log and not args.replay
+    hub = Hub(log_enabled=log_enabled)
     threading.Thread(target=hub.stats_loop, daemon=True).start()
 
     if args.simulate:
         threading.Thread(target=run_simulator, args=(hub,), daemon=True).start()
+    elif args.replay:
+        threading.Thread(target=run_replay, args=(hub, args.replay, args.speed), daemon=True).start()
     else:
+        threading.Thread(target=lsof_loop, daemon=True).start()
         threading.Thread(target=run_tcpdump, args=(hub, args.iface), daemon=True).start()
 
     class Server(ThreadingHTTPServer):
@@ -404,7 +494,7 @@ def main():
     server = Server(("127.0.0.1", args.port), make_handler(hub))
     print(f"[server] dashboard:  http://localhost:{args.port}/")
     print(f"[server] event feed: http://localhost:{args.port}/events")
-    if not args.no_log:
+    if log_enabled:
         print(f"[log]    {LOG_PATH}")
     try:
         server.serve_forever()
